@@ -31,14 +31,14 @@ impl <K, V> fmt::Debug for CacheValue<K, V> {
 intrusive_adapter!(CacheValueAdapter<K, V> = Rc<CacheValue<K, V>>: CacheValue<K, V> { link: LinkedListLink });
 
 
-pub struct LRUCache<K: Eq + std::hash::Hash + Copy, V> {
+pub struct LRUCache<K: Eq + std::hash::Hash + Clone, V> {
     map: HashMap<K, Rc<CacheValue<K, V>>>,
     lru_list: RefCell<LinkedList<CacheValueAdapter<K, V>>>,
     capacity: usize
 }
 
 
-impl <K: Eq + std::hash::Hash + Copy, V> LRUCache<K, V> {
+impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
     /// Create a LRUCache with space for ``capacity`` items.
     pub fn new(capacity: usize) -> LRUCache<K, V> {
         LRUCache {
@@ -62,7 +62,7 @@ impl <K: Eq + std::hash::Hash + Copy, V> LRUCache<K, V> {
     /// Put ``value`` into cache for ``key``.
     /// Returns the previous value if there was one.
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
-        let cache_value = Rc::new(CacheValue::new(key, value));
+        let cache_value = Rc::new(CacheValue::new(key.clone(), value));
         if !self.map.contains_key(&key) {
             self.make_room();
         }
