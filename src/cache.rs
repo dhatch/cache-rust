@@ -1,8 +1,7 @@
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use std::fmt;
 use std::mem;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use intrusive_collections::{LinkedList, LinkedListLink};
 use intrusive_collections::intrusive_adapter;
 
@@ -11,6 +10,9 @@ struct CacheValue<K, V> {
     value: V,
     link: LinkedListLink
 }
+
+// HACK: Fix this... not sure why but LinkedlistLink isn't sync.
+unsafe impl <K,V> Sync for CacheValue<K,V> {}
 
 impl <K, V> CacheValue<K, V> {
     fn new(key: K, value: V) -> CacheValue<K, V> {
@@ -28,7 +30,7 @@ impl <K, V> fmt::Debug for CacheValue<K, V> {
     }
 }
 
-intrusive_adapter!(CacheValueAdapter<K, V> = Rc<CacheValue<K, V>>: CacheValue<K, V> { link: LinkedListLink });
+intrusive_adapter!(CacheValueAdapter<K, V> = Arc<CacheValue<K, V>>: CacheValue<K, V> { link: LinkedListLink });
 
 
 /// LRUCache implements an in-memory cache of fixed capacity with a least-recency-used replacement
@@ -57,18 +59,18 @@ intrusive_adapter!(CacheValueAdapter<K, V> = Rc<CacheValue<K, V>>: CacheValue<K,
 ///
 /// # Concerns:
 ///
-/// This data structure is pretty poor for cache-locality (if I am understanding Rc correctly).
+/// This data structure is pretty poor for cache-locality (if I am understanding Arc correctly).
 /// Each value is separately allocated, so the data the cache points to will not be brought into
-/// cache together.  Ideally, we would allocate the memory that each Rc points to from a single
+/// cache together.  Ideally, we would allocate the memory that each Arc points to from a single
 /// buffer.
-pub struct LRUCache<K: Eq + std::hash::Hash + Clone, V> {
-    map: HashMap<K, Rc<CacheValue<K, V>>>,
-    lru_list: RefCell<LinkedList<CacheValueAdapter<K, V>>>,
+pub struct LRUCache<K: Eq + std::hash::Hash + Clone, V: Clone> {
+    map: Mutex<HashMap<K, Arc<CacheValue<K, V>>>>,
+    lru_list: Mutex<LinkedList<CacheValueAdapter<K, V>>>,
     capacity: usize
 }
 
 
-impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
+impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
     /// Create a LRUCache with space for `capacity` items.
     ///
     /// # Arguments:
@@ -80,19 +82,21 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
     /// - The cache will allocate memory for all items, even if it is not full.
     pub fn new(capacity: usize) -> LRUCache<K, V> {
         LRUCache {
-            map: HashMap::with_capacity(capacity),
-            lru_list: RefCell::new(LinkedList::new(CacheValueAdapter::new())),
+            map: Mutex::new(HashMap::with_capacity(capacity)),
+            lru_list: Mutex::new(LinkedList::new(CacheValueAdapter::new())),
             capacity
         }
     }
 
     /// Get the value for `key` in `self`, if it exists.  Otherwise, return `None`.
-    pub fn get(&self, key: &K) -> Option<&V> {
-        match self.map.get(key) {
+    pub fn get(&self, key: &K) -> Option<V> {
+        let map = self.map.lock().unwrap();
+
+        match map.get(key) {
             None => None,
             Some(cache_value) => {
                 self.touch(cache_value);
-                Some(&cache_value.value)
+                Some(cache_value.value.clone())
             }
         }
     }
@@ -103,14 +107,21 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
     ///
     /// The previous value in the cache, or `None`.
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
-        let cache_value = Rc::new(CacheValue::new(key.clone(), value));
+        let cache_value = Arc::new(CacheValue::new(key.clone(), value));
 
         // We only need to make room for a new value if we are not replacing an old one.
-        if !self.map.contains_key(&key) {
+        let contains_key = {
+            let map = self.map.lock().unwrap();
+            map.contains_key(&key)
+        };
+
+        if !contains_key {
             self.make_room();
         }
 
-        let old_value = match self.map.insert(key, Rc::clone(&cache_value)) {
+        let map = self.map.get_mut().unwrap();
+        let lru_list = self.lru_list.get_mut().unwrap();
+        let old_value = match map.insert(key, Arc::clone(&cache_value)) {
             None => None,
             Some(cache_value) => {
                 let value;
@@ -120,19 +131,20 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
                 //
                 // Assumes that cache_value is already in `lru_list`.
                 unsafe {
-                    let raw = Rc::into_raw(cache_value);
-                    let mut cursor = self.lru_list.get_mut().cursor_mut_from_ptr(raw);
+
+                    let raw = Arc::into_raw(cache_value);
+                    let mut cursor = lru_list.cursor_mut_from_ptr(raw);
                     value = cursor.remove();
 
-                    // Converts raw pointer back into a `Rc<CacheValue>` that can be dropped at the
+                    // Converts raw pointer back into a `Arc<CacheValue>` that can be dropped at the
                     // end of this scope.
-                    Rc::from_raw(raw);
+                    Arc::from_raw(raw);
                 }
 
 
-                match Rc::try_unwrap(value.expect("Unexpected error")) {
+                match Arc::try_unwrap(value.expect("Unexpected error")) {
                     Err(rc) => {
-                        panic!("Expected one owner for rc, found {}", Rc::strong_count(&rc))
+                        panic!("Expected one owner for rc, found {}", Arc::strong_count(&rc))
                     },
                     Ok(value) => {
                         Some(value.value)
@@ -141,7 +153,7 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
             }
         };
 
-        self.lru_list.get_mut().push_front(Rc::clone(&cache_value));
+        lru_list.push_front(Arc::clone(&cache_value));
 
         old_value
     }
@@ -155,7 +167,7 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
     /// - Assumes that ``cache_value`` is already in lru_list.  If not, behavior is
     ///   undefined.
     fn touch(&self, cache_value: &CacheValue<K, V>) {
-        let mut lru_list = self.lru_list.borrow_mut();
+        let mut lru_list = self.lru_list.lock().unwrap();
 
         let mut cursor;
         unsafe {
@@ -171,15 +183,20 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
 
     /// Make room for a new value.  If the cache is full, perform eviction.
     fn make_room(&mut self) {
-        if self.map.len() == self.capacity {
+        let len = {
+            let map =self.map.lock().unwrap();
+            map.len()
+        };
+
+        if len == self.capacity {
             self.evict_lru();
         }
     }
 
     /// Perform lru eviction.
     fn evict_lru(&mut self) {
-        let lru_value = self.lru_list.get_mut().pop_front();
-        if let None = self.map.remove(&lru_value.expect("List must not be none").key) {
+        let lru_value = self.lru_list.get_mut().unwrap().pop_front();
+        if let None = self.map.get_mut().unwrap().remove(&lru_value.expect("List must not be none").key) {
             unreachable!();
         }
     }
@@ -194,7 +211,7 @@ mod tests {
         let k1 = "key";
         let mut cache: LRUCache<&str, u64> = LRUCache::new(1);
         cache.put(k1, 2);
-        assert_eq!(cache.get(&k1), Some(&2));
+        assert_eq!(cache.get(&k1), Some(2));
     }
 
     #[test]
@@ -212,13 +229,13 @@ mod tests {
         let v2 = 2;
 
         let mut cache: LRUCache<&str, u64> = LRUCache::new(1);
-        assert_eq!(cache.map.len(), 0);
+        assert_eq!(cache.map.lock().unwrap().len(), 0);
 
         cache.put(k1, v1);
-        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.map.lock().unwrap().len(), 1);
 
         cache.put(k2, v2);
-        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.map.lock().unwrap().len(), 1);
 
         assert_eq!(cache.get(&k1), None);
     }
@@ -231,10 +248,10 @@ mod tests {
         let v2 = 2;
 
         let mut cache: LRUCache<&str, u64> = LRUCache::new(1);
-        assert_eq!(cache.map.len(), 0);
+        assert_eq!(cache.map.lock().unwrap().len(), 0);
 
         cache.put(k1, v1);
         cache.put(k1, v2);
-        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.map.lock().unwrap().len(), 1);
     }
 }
