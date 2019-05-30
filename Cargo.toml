@@ -1,8 +1,17 @@
 [package]
-name = "rust"
+name = "cache"
 version = "0.1.0"
 authors = ["David Hatch <dhatch387@gmail.com>"]
 edition = "2018"
 
 [dependencies]
 intrusive-collections = "0.7.8"
+
+[dev-dependencies]
+bencher = "0.1.5"
+
+[workspace]
+
+[[bench]]
+name = "bench_main"
+harness = false
