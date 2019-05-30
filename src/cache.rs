@@ -2,10 +2,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::fmt;
 use std::mem;
+use std::sync::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use intrusive_collections::{LinkedList, LinkedListLink};
 use intrusive_collections::intrusive_adapter;
 
+/// Wrapper for values in the cache that implements a node in a linked list.
 struct CacheValue<K, V> {
     key: K,
     value: V,
@@ -30,6 +32,13 @@ impl <K, V> fmt::Debug for CacheValue<K, V> {
 
 intrusive_adapter!(CacheValueAdapter<K, V> = Rc<CacheValue<K, V>>: CacheValue<K, V> { link: LinkedListLink });
 
+
+/// Not sure what is typical pattern in Rust, but using this to encapsulate data protected by a
+/// mutex.
+struct LRUCacheData<K, V> {
+    map: HashMap<K, Rc<CacheValue<K, V>>>,
+    lru_list: RefCell<LinkedList<CacheValueAdapter<K, V>>>
+}
 
 /// LRUCache implements an in-memory cache of fixed capacity with a least-recency-used replacement
 /// policy.
@@ -61,14 +70,13 @@ intrusive_adapter!(CacheValueAdapter<K, V> = Rc<CacheValue<K, V>>: CacheValue<K,
 /// Each value is separately allocated, so the data the cache points to will not be brought into
 /// cache together.  Ideally, we would allocate the memory that each Rc points to from a single
 /// buffer.
-pub struct LRUCache<K: Eq + std::hash::Hash + Clone, V> {
-    map: HashMap<K, Rc<CacheValue<K, V>>>,
-    lru_list: RefCell<LinkedList<CacheValueAdapter<K, V>>>,
+pub struct LRUCache<K: Eq + std::hash::Hash + Clone, V: Clone> {
+    data: Mutex<LRUCacheData<K, V>>,
     capacity: usize
 }
 
 
-impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
+impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
     /// Create a LRUCache with space for `capacity` items.
     ///
     /// # Arguments:
@@ -80,19 +88,31 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
     /// - The cache will allocate memory for all items, even if it is not full.
     pub fn new(capacity: usize) -> LRUCache<K, V> {
         LRUCache {
-            map: HashMap::with_capacity(capacity),
-            lru_list: RefCell::new(LinkedList::new(CacheValueAdapter::new())),
+            data: Mutex::new(LRUCacheData {
+                map: HashMap::with_capacity(capacity),
+                lru_list: RefCell::new(LinkedList::new(CacheValueAdapter::new())),
+            }),
             capacity
         }
     }
 
     /// Get the value for `key` in `self`, if it exists.  Otherwise, return `None`.
-    pub fn get(&self, key: &K) -> Option<&V> {
-        match self.map.get(key) {
+    ///
+    /// Implementation note:
+    ///
+    /// The value is cloned out of the cache, otherwise the reader would need to keep
+    /// the mutex while it works with the value. Since the cache is designed for servicing
+    /// HTTP requests, a copy will be necessary anyway.
+    ///
+    /// This is an area for improvement (API to return some kind of handle that drops the mutex
+    /// is too time consuming for me to figure out for now).
+    pub fn get(&self, key: &K) -> Option<V> {
+        let data = self.data.lock().unwrap();
+        match data.map.get(key) {
             None => None,
             Some(cache_value) => {
-                self.touch(cache_value);
-                Some(&cache_value.value)
+                self.touch(&data, cache_value);
+                Some(cache_value.value.clone())
             }
         }
     }
@@ -106,11 +126,20 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
         let cache_value = Rc::new(CacheValue::new(key.clone(), value));
 
         // We only need to make room for a new value if we are not replacing an old one.
-        if !self.map.contains_key(&key) {
-            self.make_room();
+        // TODO: Ran into some borrow checker issues here that I couldn't figure out elegantly.
+        // It seems like MutexGuard / mutable data cannot be safely passed around between
+        // methods without releasing and reacquiring it.
+        {
+            let data = self.data.lock().unwrap();
+            if !data.map.contains_key(&key) {
+                mem::drop(data);
+                self.make_room();
+            }
         }
 
-        let old_value = match self.map.insert(key, Rc::clone(&cache_value)) {
+        let data = self.data.get_mut().unwrap();
+
+        let old_value = match data.map.insert(key, Rc::clone(&cache_value)) {
             None => None,
             Some(cache_value) => {
                 let value;
@@ -121,7 +150,7 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
                 // Assumes that cache_value is already in `lru_list`.
                 unsafe {
                     let raw = Rc::into_raw(cache_value);
-                    let mut cursor = self.lru_list.get_mut().cursor_mut_from_ptr(raw);
+                    let mut cursor = data.lru_list.get_mut().cursor_mut_from_ptr(raw);
                     value = cursor.remove();
 
                     // Converts raw pointer back into a `Rc<CacheValue>` that can be dropped at the
@@ -141,7 +170,7 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
             }
         };
 
-        self.lru_list.get_mut().push_front(Rc::clone(&cache_value));
+        data.lru_list.get_mut().push_front(Rc::clone(&cache_value));
 
         old_value
     }
@@ -154,8 +183,8 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
     ///
     /// - Assumes that ``cache_value`` is already in lru_list.  If not, behavior is
     ///   undefined.
-    fn touch(&self, cache_value: &CacheValue<K, V>) {
-        let mut lru_list = self.lru_list.borrow_mut();
+    fn touch(&self, data: &MutexGuard<LRUCacheData<K, V>>, cache_value: &CacheValue<K, V>) {
+        let mut lru_list = data.lru_list.borrow_mut();
 
         let mut cursor;
         unsafe {
@@ -171,15 +200,18 @@ impl <K: Eq + std::hash::Hash + Clone, V> LRUCache<K, V> {
 
     /// Make room for a new value.  If the cache is full, perform eviction.
     fn make_room(&mut self) {
-        if self.map.len() == self.capacity {
+        let data = self.data.lock().unwrap();
+        if data.map.len() == self.capacity {
+            mem::drop(data);
             self.evict_lru();
         }
     }
 
     /// Perform lru eviction.
     fn evict_lru(&mut self) {
-        let lru_value = self.lru_list.get_mut().pop_front();
-        if let None = self.map.remove(&lru_value.expect("List must not be none").key) {
+        let data = self.data.get_mut().unwrap();
+        let lru_value = data.lru_list.get_mut().pop_front();
+        if let None = data.map.remove(&lru_value.expect("List must not be none").key) {
             unreachable!();
         }
     }
@@ -194,7 +226,7 @@ mod tests {
         let k1 = "key";
         let mut cache: LRUCache<&str, u64> = LRUCache::new(1);
         cache.put(k1, 2);
-        assert_eq!(cache.get(&k1), Some(&2));
+        assert_eq!(cache.get(&k1), Some(2));
     }
 
     #[test]
@@ -212,13 +244,13 @@ mod tests {
         let v2 = 2;
 
         let mut cache: LRUCache<&str, u64> = LRUCache::new(1);
-        assert_eq!(cache.map.len(), 0);
+        assert_eq!(cache.data.lock().unwrap().map.len(), 0);
 
         cache.put(k1, v1);
-        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.data.lock().unwrap().map.len(), 1);
 
         cache.put(k2, v2);
-        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.data.lock().unwrap().map.len(), 1);
 
         assert_eq!(cache.get(&k1), None);
     }
@@ -231,10 +263,10 @@ mod tests {
         let v2 = 2;
 
         let mut cache: LRUCache<&str, u64> = LRUCache::new(1);
-        assert_eq!(cache.map.len(), 0);
+        assert_eq!(cache.data.lock().unwrap().map.len(), 0);
 
         cache.put(k1, v1);
         cache.put(k1, v2);
-        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.data.lock().unwrap().map.len(), 1);
     }
 }
