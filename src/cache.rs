@@ -1,8 +1,6 @@
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use std::fmt;
 use std::mem;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::collections::HashMap;
 use intrusive_collections::{LinkedList, LinkedListLink};
 use intrusive_collections::intrusive_adapter;
@@ -30,14 +28,14 @@ impl <K, V> fmt::Debug for CacheValue<K, V> {
     }
 }
 
-intrusive_adapter!(CacheValueAdapter<K, V> = Rc<CacheValue<K, V>>: CacheValue<K, V> { link: LinkedListLink });
+intrusive_adapter!(CacheValueAdapter<K, V> = Arc<CacheValue<K, V>>: CacheValue<K, V> { link: LinkedListLink });
 
 
 /// Not sure what is typical pattern in Rust, but using this to encapsulate data protected by a
 /// mutex.
 struct LRUCacheData<K, V> {
-    map: HashMap<K, Rc<CacheValue<K, V>>>,
-    lru_list: RefCell<LinkedList<CacheValueAdapter<K, V>>>
+    map: HashMap<K, Arc<CacheValue<K, V>>>,
+    lru_list: LinkedList<CacheValueAdapter<K, V>>
 }
 
 /// LRUCache implements an in-memory cache of fixed capacity with a least-recency-used replacement
@@ -90,7 +88,7 @@ impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
         LRUCache {
             data: Mutex::new(LRUCacheData {
                 map: HashMap::with_capacity(capacity),
-                lru_list: RefCell::new(LinkedList::new(CacheValueAdapter::new())),
+                lru_list: LinkedList::new(CacheValueAdapter::new()),
             }),
             capacity
         }
@@ -108,10 +106,23 @@ impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
     /// is too time consuming for me to figure out for now).
     pub fn get(&self, key: &K) -> Option<V> {
         let data = self.data.lock().unwrap();
-        match data.map.get(key) {
+        let map = &data.map;
+        let mut lru_list = &mut data.lru_list;
+
+        match map.get(key) {
             None => None,
             Some(cache_value) => {
-                self.touch(&data, cache_value);
+                let mut cursor;
+                unsafe {
+                    cursor = lru_list.cursor_mut_from_ptr(&**cache_value);
+                }
+
+                if let Some(removed_value) = cursor.remove() {
+                    lru_list.push_front(removed_value);
+                } else {
+                    unreachable!()
+                }
+
                 Some(cache_value.value.clone())
             }
         }
@@ -123,7 +134,7 @@ impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
     ///
     /// The previous value in the cache, or `None`.
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
-        let cache_value = Rc::new(CacheValue::new(key.clone(), value));
+        let cache_value = Arc::new(CacheValue::new(key.clone(), value));
 
         // We only need to make room for a new value if we are not replacing an old one.
         // TODO: Ran into some borrow checker issues here that I couldn't figure out elegantly.
@@ -139,7 +150,7 @@ impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
 
         let data = self.data.get_mut().unwrap();
 
-        let old_value = match data.map.insert(key, Rc::clone(&cache_value)) {
+        let old_value = match data.map.insert(key, Arc::clone(&cache_value)) {
             None => None,
             Some(cache_value) => {
                 let value;
@@ -149,19 +160,19 @@ impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
                 //
                 // Assumes that cache_value is already in `lru_list`.
                 unsafe {
-                    let raw = Rc::into_raw(cache_value);
-                    let mut cursor = data.lru_list.get_mut().cursor_mut_from_ptr(raw);
+                    let raw = Arc::into_raw(cache_value);
+                    let mut cursor = data.lru_list.cursor_mut_from_ptr(raw);
                     value = cursor.remove();
 
                     // Converts raw pointer back into a `Rc<CacheValue>` that can be dropped at the
                     // end of this scope.
-                    Rc::from_raw(raw);
+                    Arc::from_raw(raw);
                 }
 
 
-                match Rc::try_unwrap(value.expect("Unexpected error")) {
+                match Arc::try_unwrap(value.expect("Unexpected error")) {
                     Err(rc) => {
-                        panic!("Expected one owner for rc, found {}", Rc::strong_count(&rc))
+                        panic!("Expected one owner for rc, found {}", Arc::strong_count(&rc))
                     },
                     Ok(value) => {
                         Some(value.value)
@@ -170,7 +181,7 @@ impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
             }
         };
 
-        data.lru_list.get_mut().push_front(Rc::clone(&cache_value));
+        data.lru_list.push_front(Arc::clone(&cache_value));
 
         old_value
     }
@@ -183,20 +194,20 @@ impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
     ///
     /// - Assumes that ``cache_value`` is already in lru_list.  If not, behavior is
     ///   undefined.
-    fn touch(&self, data: &MutexGuard<LRUCacheData<K, V>>, cache_value: &CacheValue<K, V>) {
-        let mut lru_list = data.lru_list.borrow_mut();
+    //fn touch(&self, data: &mut MutexGuard<LRUCacheData<K, V>>, cache_value: &CacheValue<K, V>) {
+        //let mut lru_list = &mut data.lru_list;
 
-        let mut cursor;
-        unsafe {
-            cursor = lru_list.cursor_mut_from_ptr(cache_value);
-        }
+        //let mut cursor;
+        //unsafe {
+            //cursor = lru_list.cursor_mut_from_ptr(cache_value);
+        //}
 
-        if let Some(removed_value) = cursor.remove() {
-            lru_list.push_front(removed_value);
-        } else {
-            unreachable!()
-        }
-    }
+        //if let Some(removed_value) = cursor.remove() {
+            //lru_list.push_front(removed_value);
+        //} else {
+            //unreachable!()
+        //}
+    //}
 
     /// Make room for a new value.  If the cache is full, perform eviction.
     fn make_room(&mut self) {
@@ -210,7 +221,7 @@ impl <K: Eq + std::hash::Hash + Clone, V: Clone> LRUCache<K, V> {
     /// Perform lru eviction.
     fn evict_lru(&mut self) {
         let data = self.data.get_mut().unwrap();
-        let lru_value = data.lru_list.get_mut().pop_front();
+        let lru_value = data.lru_list.pop_front();
         if let None = data.map.remove(&lru_value.expect("List must not be none").key) {
             unreachable!();
         }

@@ -8,6 +8,7 @@ edition = "2018"
 intrusive-collections = "0.7.8"
 
 [dev-dependencies]
+rand = "0.6.5"
 bencher = "0.1.5"
 
 [workspace]
